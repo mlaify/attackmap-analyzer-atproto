@@ -1,0 +1,9 @@
+{
+  "name": "@example/atproto-like-repo",
+  "private": true,
+  "workspaces": ["packages/*"],
+  "dependencies": {
+    "@atproto/xrpc-server": "^0.0.0",
+    "ws": "^8.18.0"
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "lexicon": 1,
+  "id": "com.atproto.server.createSession",
+  "defs": {
+    "main": {
+      "type": "procedure"
+    }
+  }
+}

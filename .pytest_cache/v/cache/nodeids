@@ -1,0 +1,6 @@
+[
+  "tests/test_atproto_analyzer.py::test_analyze_extracts_protocol_surface_and_hints",
+  "tests/test_atproto_analyzer.py::test_analyze_returns_core_compatible_scan_shape",
+  "tests/test_atproto_analyzer.py::test_detect_identifies_atproto_style_repo",
+  "tests/test_atproto_analyzer.py::test_metadata_contains_required_fields"
+]
