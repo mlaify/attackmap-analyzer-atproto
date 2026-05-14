@@ -15,7 +15,7 @@ This module is heuristic and intentionally lightweight.
 ## Install
 
 ```bash
-pip install git+https://gitlab.com/matthewd.xyzAI/attackmap-analyzers/attackmap-analyzer-atproto.git
+pip install git+https://github.com/mlaify/attackmap-analyzer-atproto.git
 ```
 
 ## Usage
