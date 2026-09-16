@@ -1,5 +1,10 @@
 # AttackMap ATProto Analyzer
 
+> [!NOTE]
+> **Development is paused.** This project is not under active development.
+> The code remains available for reference, and security reports are still
+> welcome at [security@mlaify.io](mailto:security@mlaify.io).
+
 `attackmap-analyzer-atproto` is a thin protocol-aware overlay analyzer for AttackMap.
 
 It is designed to enrich Node/TypeScript service scans (such as `node-service`) with
