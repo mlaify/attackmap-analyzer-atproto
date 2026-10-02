@@ -1,4 +1,9 @@
+import shutil
+import sys
 from pathlib import Path
+
+import pytest
+from attackmap.safe_fs import OUTPUT_MARKER
 
 from attackmap.sdk.contracts import AnalyzerMetadata as SharedAnalyzerMetadata
 from attackmap.sdk.models import ScanResult as SharedScanResult
@@ -67,3 +72,70 @@ def test_analyze_returns_core_compatible_scan_shape() -> None:
     assert hasattr(result, "databases")
     assert hasattr(result, "auth_hints")
     assert hasattr(result, "secret_hints")
+
+
+def test_metadata_priority_and_opt_in() -> None:
+    # Core runs analyzers in (priority, name) order and merges first-seen-wins
+    # (AttackMap#221): this overlay runs after node-service (25) and stays
+    # opt-in via `-m atproto`.
+    metadata = AtprotoAnalyzer().metadata
+    assert metadata.priority == 90
+    assert metadata.enabled_by_default is False
+
+
+# ---------------------------------------------------------------------------
+# Repo walking via attackmap.sdk.fs (AttackMap#253)
+# ---------------------------------------------------------------------------
+
+
+def test_repo_checked_out_under_build_dir_is_still_analyzed(tmp_path: Path) -> None:
+    # Skip dirs used to be matched against absolute path parts, so a repo
+    # under any `build/` directory yielded nothing at all.
+    repo = tmp_path / "build" / "out" / "repo"
+    shutil.copytree(FIXTURES / "atproto_like_repo", repo)
+    analyzer = AtprotoAnalyzer()
+    assert analyzer.detect(repo) is True
+    result = analyzer.analyze(repo)
+    assert result.files_scanned > 0
+    assert ("/xrpc/com.atproto.server.createSession", "ANY") in {(r.path, r.method) for r in result.routes}
+    assert "atproto_service_note:pds" in {h.hint for h in result.auth_hints}
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="symlinks need privileges on Windows")
+def test_symlinked_source_outside_repo_is_not_analyzed(tmp_path: Path) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.ts").write_text("fetch('/xrpc/app.bsky.outside.secret');\nprocess.env.OUTSIDE_SECRET_KEY;\n")
+    repo = tmp_path / "repo"
+    shutil.copytree(FIXTURES / "atproto_like_repo", repo)
+    (repo / "packages" / "pds" / "src" / "linked.ts").symlink_to(outside / "secret.ts")
+
+    result = AtprotoAnalyzer().analyze(repo)
+    assert "/xrpc/app.bsky.outside.secret" not in {r.path for r in result.routes}
+    assert "OUTSIDE_SECRET_KEY" not in {s.name for s in result.secret_hints}
+
+
+def test_attackmap_report_output_is_not_analyzed(tmp_path: Path) -> None:
+    # A previous run's JSON report mentions every NSID it found; reading it
+    # back would echo old findings into the new scan.
+    repo = tmp_path / "repo"
+    shutil.copytree(FIXTURES / "atproto_like_repo", repo)
+    reports = repo / "reports"
+    reports.mkdir()
+    (reports / OUTPUT_MARKER).write_text("")
+    (reports / "attackmap-report.json").write_text('{"routes": ["/xrpc/app.bsky.stale.fromReport"]}')
+    gui = repo / ".attackmap-gui"
+    gui.mkdir()
+    (gui / "last.json").write_text('{"nsid": "app.bsky.stale.fromGui"}')
+
+    result = AtprotoAnalyzer().analyze(repo)
+    files = {h.file for h in result.auth_hints} | {r.file for r in result.routes}
+    assert not any(f.startswith(("reports/", ".attackmap-gui/")) for f in files)
+    assert not any("stale" in h.hint for h in result.auth_hints)
+
+
+def test_detect_ignores_atproto_names_above_the_repo(tmp_path: Path) -> None:
+    repo = tmp_path / "app.bsky" / "repo"
+    repo.mkdir(parents=True)
+    (repo / "main.py").write_text("print('hello')\n")
+    assert AtprotoAnalyzer().detect(repo) is False
