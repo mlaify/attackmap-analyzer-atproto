@@ -4,10 +4,14 @@ import json
 import re
 from pathlib import Path
 
+from attackmap.sdk import DEFAULT_SKIP_DIRS, iter_repo_files, read_source, rel
+
 from .contracts import AnalyzerMetadata, AuthHint, ExternalCall, Route, ScanResult, SecretHint
 
 CODE_SUFFIXES = {".ts", ".tsx", ".js", ".mjs", ".cjs", ".json"}
-SKIP_DIRS = {"node_modules", ".git", "dist", "build", ".next"}
+# Pruned by repo-relative directory name; also skips AttackMap's own report
+# output, so a previous run's attackmap-report.json isn't re-read (AttackMap#253).
+SKIP_DIRS = DEFAULT_SKIP_DIRS
 
 NAMESPACE_PATTERN = re.compile(r"\b((?:com\.atproto|app\.bsky)(?:\.[a-z0-9_]+){1,})\b", re.IGNORECASE)
 XRPC_LITERAL_PATTERN = re.compile(r"['\"](?:https?://[^'\"]+)?/xrpc/((?:com\.atproto|app\.bsky)\.[a-z0-9_.]+)['\"]", re.IGNORECASE)
@@ -38,7 +42,7 @@ class AtprotoAnalyzer:
         scope="AT Protocol repositories with lexicons, XRPC namespace usage, and protocol auth/identity cues.",
         targets=["atproto", "bluesky", "xrpc"],
         languages=["typescript", "javascript", "json"],
-        priority=35,
+        priority=90,
         experimental=True,
         enabled_by_default=False,
     )
@@ -55,17 +59,15 @@ class AtprotoAnalyzer:
         if (root / "lexicons").is_dir():
             return True
 
-        for file_path in root.rglob("*"):
-            if not file_path.is_file():
-                continue
-            if any(part in SKIP_DIRS for part in file_path.parts):
-                continue
-            path_text = str(file_path).lower()
+        for file_path in iter_repo_files(root, skip_dirs=SKIP_DIRS):
+            # Repo-relative, so a checkout under e.g. ~/src/app.bsky/ doesn't
+            # make every repo look like an AT Protocol one.
+            path_text = rel(file_path, root).lower()
             if "com.atproto" in path_text or "app.bsky" in path_text:
                 return True
-            if file_path.suffix not in CODE_SUFFIXES:
+            if file_path.suffix.lower() not in CODE_SUFFIXES:
                 continue
-            content = self._read_text(file_path)
+            content = read_source(file_path)
             if not content:
                 continue
             if (
@@ -83,31 +85,33 @@ class AtprotoAnalyzer:
         if not root.exists() or not root.is_dir():
             return result
 
-        lexicon_files = list(root.rglob("lexicons/**/*.json")) if (root / "lexicons").is_dir() else []
+        has_lexicons_dir = (root / "lexicons").is_dir()
+        lexicon_files: list[Path] = []
+        code_files: list[Path] = []
+        for file_path in iter_repo_files(root, suffixes=CODE_SUFFIXES, skip_dirs=SKIP_DIRS):
+            # `**/lexicons/**/*.json`: lexicon documents get lexicon parsing only.
+            in_lexicons = "lexicons" in rel(file_path, root).split("/")[:-1]
+            if has_lexicons_dir and in_lexicons and file_path.suffix.lower() == ".json":
+                lexicon_files.append(file_path)
+            else:
+                code_files.append(file_path)
+
         for lexicon_path in lexicon_files:
-            if any(part in SKIP_DIRS for part in lexicon_path.parts):
-                continue
             result.files_scanned += 1
             self._append_language(result, "json")
-            relative = str(lexicon_path.relative_to(root))
-            self._extract_lexicon_signals(lexicon_path, relative, result)
-
-        for file_path in root.rglob("*"):
-            if not file_path.is_file():
-                continue
-            if file_path in lexicon_files:
-                continue
-            if file_path.suffix not in CODE_SUFFIXES:
-                continue
-            if any(part in SKIP_DIRS for part in file_path.parts):
-                continue
-
-            result.files_scanned += 1
-            self._append_language(result, "typescript" if file_path.suffix in {".ts", ".tsx"} else ("javascript" if file_path.suffix in {".js", ".mjs", ".cjs"} else "json"))
-            content = self._read_text(file_path)
+            content = read_source(lexicon_path)
             if content is None:
                 continue
-            relative = str(file_path.relative_to(root))
+            self._extract_lexicon_signals(content, rel(lexicon_path, root), result)
+
+        for file_path in code_files:
+            suffix = file_path.suffix.lower()
+            result.files_scanned += 1
+            self._append_language(result, "typescript" if suffix in {".ts", ".tsx"} else ("javascript" if suffix in {".js", ".mjs", ".cjs"} else "json"))
+            content = read_source(file_path)
+            if content is None:
+                continue
+            relative = rel(file_path, root)
 
             self._extract_namespace_signals(content, relative, result)
             self._extract_xrpc_literals(content, relative, result)
@@ -120,10 +124,12 @@ class AtprotoAnalyzer:
         result.languages.sort()
         return result
 
-    def _extract_lexicon_signals(self, lexicon_path: Path, relative: str, result: ScanResult) -> None:
+    def _extract_lexicon_signals(self, content: str, relative: str, result: ScanResult) -> None:
         try:
-            data = json.loads(lexicon_path.read_text(encoding="utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError):
+            data = json.loads(content)
+        except json.JSONDecodeError:
+            return
+        if not isinstance(data, dict):
             return
 
         lexicon_id = data.get("id")
@@ -220,13 +226,6 @@ class AtprotoAnalyzer:
     def _append_language(result: ScanResult, language: str) -> None:
         if language not in result.languages:
             result.languages.append(language)
-
-    @staticmethod
-    def _read_text(path: Path) -> str | None:
-        try:
-            return path.read_text(encoding="utf-8")
-        except UnicodeDecodeError:
-            return None
 
     @staticmethod
     def _append_unique_route(result: ScanResult, path: str, method: str, file: str) -> None:
