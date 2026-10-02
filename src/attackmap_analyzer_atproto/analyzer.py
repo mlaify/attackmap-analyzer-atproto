@@ -323,11 +323,22 @@ class AtprotoAnalyzer:
             offset = match.start()
             line = line_of(content, offset)
             method = lexicon_types.get(nsid, "ANY")
-            self._append_unique_route(result, f"/xrpc/{nsid}", method, relative, line)
             literal = self._object_literal_top_level(content, match.end())
             verifier_match = AUTH_KEY_PATTERN.search(literal[1]) if literal is not None else None
             verifier = verifier_match.group("verifier").strip() if verifier_match else None
-            if literal is not None and verifier_match and verifier and not OPTIONAL_VERIFIER_PATTERN.search(verifier):
+            guarded = bool(
+                literal is not None and verifier_match and verifier and not OPTIONAL_VERIFIER_PATTERN.search(verifier)
+            )
+            # Route.auth (AttackMap#256): a required verifier guards the
+            # endpoint; no verifier, or one that admits unauthenticated
+            # callers, leaves it reachable anonymously.
+            self._append_unique_route(
+                result, f"/xrpc/{nsid}", method, relative, line,
+                auth="required" if guarded else "anonymous",
+                guards=[f"auth: {verifier}"] if guarded else [],
+                guard_evidence=(f"auth: {verifier}" if verifier else "no auth verifier on handler"),
+            )
+            if guarded:
                 # Cite the `auth: <verifier>` line itself.
                 verifier_offset = literal[0] + verifier_match.start("verifier")
                 self._append_unique_auth(
@@ -451,11 +462,29 @@ class AtprotoAnalyzer:
             result.languages.append(language)
 
     @staticmethod
-    def _append_unique_route(result: ScanResult, path: str, method: str, file: str, line: int) -> None:
+    def _append_unique_route(
+        result: ScanResult,
+        path: str,
+        method: str,
+        file: str,
+        line: int,
+        *,
+        auth: str = "unknown",
+        guards: list[str] | None = None,
+        guard_evidence: str | None = None,
+    ) -> None:
         key = (path, method, file)
-        if any((item.path, item.method, item.file) == key for item in result.routes):
-            return
-        result.routes.append(Route(path=path, method=method, file=file, line=line))
+        for item in result.routes:
+            if (item.path, item.method, item.file) == key:
+                # A handler registration resolves the auth of a route first
+                # seen as a bare `/xrpc/<nsid>` literal in the same file.
+                if getattr(item, "auth", "unknown") == "unknown" and auth != "unknown":
+                    item.auth, item.guards, item.guard_evidence = auth, list(guards or []), guard_evidence
+                return
+        result.routes.append(
+            Route(path=path, method=method, file=file, line=line,
+                  auth=auth, guards=list(guards or []), guard_evidence=guard_evidence)
+        )
 
     @staticmethod
     def _append_unique_external(result: ScanResult, target: str, file: str, content: str, offset: int) -> None:

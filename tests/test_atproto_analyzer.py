@@ -254,3 +254,15 @@ def test_handlers_without_an_auth_verifier_are_marked_anonymous() -> None:
     assert verified[0].evidence_text == "auth: ctx.authVerifier.standard,"
     # The anonymous marker is never an AuthHint (core would count it as a control).
     assert not any("anonymous" in h.hint for h in result.auth_hints)
+
+
+def test_handler_routes_carry_declared_auth_state() -> None:
+    """Route.auth / guards / guard_evidence (AttackMap#256)."""
+    result = AtprotoAnalyzer().analyze(FIXTURES / OVERLAY)
+    handler_files = {h.file for h in result.auth_hints if h.hint.startswith("atproto_auth:route_verifier:")}
+    by_nsid = {r.path.removeprefix("/xrpc/"): r for r in result.routes if r.file in handler_files}
+    timeline = by_nsid["app.bsky.feed.getTimeline"]
+    assert timeline.auth == "required"
+    assert timeline.guards == ["auth: ctx.authVerifier.standard"]
+    assert by_nsid["app.bsky.feed.getPostThread"].auth == "anonymous"  # optional verifier
+    assert by_nsid["sh.tangled.repo.create"].auth == "anonymous"  # bare handler
