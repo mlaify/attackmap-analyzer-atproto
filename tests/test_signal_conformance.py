@@ -28,7 +28,11 @@ AUTH_HINT_NAMES = frozenset(
         "atproto_identity:plc",
     }
 )
-AUTH_HINT_PREFIXES: tuple[str, ...] = ()
+# `atproto_auth:route_verifier:<nsid>` (#2): the `auth:` verifier configured on
+# one XRPC handler registration. It is the per-endpoint authentication control
+# itself, so it is a genuine auth signal. Handlers *without* a verifier get an
+# `atproto_route_auth:anonymous:<nsid>` ProtocolHint instead, never an AuthHint.
+AUTH_HINT_PREFIXES: tuple[str, ...] = ("atproto_auth:route_verifier:",)
 
 SIGNAL_LISTS = (
     "routes",
