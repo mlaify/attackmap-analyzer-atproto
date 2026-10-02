@@ -42,19 +42,28 @@ def test_analyze_extracts_protocol_surface_and_hints() -> None:
 
     route_keys = {(route.path, route.method) for route in result.routes}
     auth_hints = {hint.hint for hint in result.auth_hints}
+    protocol_hints = {hint.hint for hint in result.protocol_hints}
     external_targets = {call.target for call in result.external_calls}
     secret_names = {secret.name for secret in result.secret_hints}
 
     assert ("/xrpc/com.atproto.server.createSession", "ANY") in route_keys
     assert ("/xrpc/com.atproto.sync.subscribeRepos", "SUBSCRIBE") in route_keys
 
-    assert "atproto_namespace:com.atproto" in auth_hints
-    assert "atproto_namespace:app.bsky" in auth_hints
-    assert "atproto_protocol:xrpc" in auth_hints
-    assert "atproto_event_stream:subscription_lexicon" in auth_hints
-    assert "atproto_identity:did_reference" in auth_hints
-    assert "atproto_crypto:signing" in auth_hints
-    assert "atproto_service_note:pds" in auth_hints
+    # Protocol metadata is a ProtocolHint (AttackMap#258) ...
+    assert "atproto_namespace:com.atproto" in protocol_hints
+    assert "atproto_namespace:app.bsky" in protocol_hints
+    assert "atproto_lexicon:com.atproto.server.createSession" in protocol_hints
+    assert "atproto_protocol:xrpc" in protocol_hints
+    assert "atproto_event_stream:subscription_lexicon" in protocol_hints
+    assert "atproto_service_edge:relay" in protocol_hints
+    assert "atproto_service_note:pds" in protocol_hints
+    # ... while auth, identity and signing cues stay AuthHints.
+    assert auth_hints == {
+        "atproto_auth:jwt",
+        "atproto_identity:did_reference",
+        "atproto_identity:plc",
+        "atproto_crypto:signing",
+    }
 
     assert "env://RELAY_URL" in external_targets
     assert "REPO_SIGNING_KEY" in secret_names
@@ -98,7 +107,7 @@ def test_repo_checked_out_under_build_dir_is_still_analyzed(tmp_path: Path) -> N
     result = analyzer.analyze(repo)
     assert result.files_scanned > 0
     assert ("/xrpc/com.atproto.server.createSession", "ANY") in {(r.path, r.method) for r in result.routes}
-    assert "atproto_service_note:pds" in {h.hint for h in result.auth_hints}
+    assert "atproto_service_note:pds" in {h.hint for h in result.protocol_hints}
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="symlinks need privileges on Windows")
@@ -129,9 +138,10 @@ def test_attackmap_report_output_is_not_analyzed(tmp_path: Path) -> None:
     (gui / "last.json").write_text('{"nsid": "app.bsky.stale.fromGui"}')
 
     result = AtprotoAnalyzer().analyze(repo)
-    files = {h.file for h in result.auth_hints} | {r.file for r in result.routes}
+    hints = [*result.auth_hints, *result.protocol_hints]
+    files = {h.file for h in hints} | {r.file for r in result.routes}
     assert not any(f.startswith(("reports/", ".attackmap-gui/")) for f in files)
-    assert not any("stale" in h.hint for h in result.auth_hints)
+    assert not any("stale" in h.hint for h in hints)
 
 
 def test_detect_ignores_atproto_names_above_the_repo(tmp_path: Path) -> None:
@@ -139,3 +149,13 @@ def test_detect_ignores_atproto_names_above_the_repo(tmp_path: Path) -> None:
     repo.mkdir(parents=True)
     (repo / "main.py").write_text("print('hello')\n")
     assert AtprotoAnalyzer().detect(repo) is False
+
+
+def test_lexicon_signals_cite_the_id_and_subscription_lines() -> None:
+    result = AtprotoAnalyzer().analyze(FIXTURES / "atproto_like_repo")
+    lexicon = "lexicons/com/atproto/sync/subscribeRepos.json"
+    by_hint = {h.hint: h for h in result.protocol_hints if h.file == lexicon}
+    assert by_hint["atproto_lexicon:com.atproto.sync.subscribeRepos"].evidence_text.startswith('"id"')
+    assert by_hint["atproto_event_stream:subscription_lexicon"].evidence_text == '"type": "subscription"'
+    subscribe = next(r for r in result.routes if r.file == lexicon and r.method == "SUBSCRIBE")
+    assert subscribe.line == by_hint["atproto_event_stream:subscription_lexicon"].line
