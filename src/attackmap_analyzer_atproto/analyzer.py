@@ -4,9 +4,9 @@ import json
 import re
 from pathlib import Path
 
-from attackmap.sdk import DEFAULT_SKIP_DIRS, iter_repo_files, read_source, rel
+from attackmap.sdk import DEFAULT_SKIP_DIRS, iter_repo_files, line_of, line_snippet, read_source, rel
 
-from .contracts import AnalyzerMetadata, AuthHint, ExternalCall, Route, ScanResult, SecretHint
+from .contracts import AnalyzerMetadata, AuthHint, ExternalCall, ProtocolHint, Route, ScanResult, SecretHint
 
 CODE_SUFFIXES = {".ts", ".tsx", ".js", ".mjs", ".cjs", ".json"}
 # Pruned by repo-relative directory name; also skips AttackMap's own report
@@ -17,14 +17,21 @@ NAMESPACE_PATTERN = re.compile(r"\b((?:com\.atproto|app\.bsky)(?:\.[a-z0-9_]+){1
 XRPC_LITERAL_PATTERN = re.compile(r"['\"](?:https?://[^'\"]+)?/xrpc/((?:com\.atproto|app\.bsky)\.[a-z0-9_.]+)['\"]", re.IGNORECASE)
 ENV_URL_PATTERN = re.compile(r"process\.env\.([A-Z0-9_]+_URL)\b")
 
+# Auth, identity (DID/PLC) and signing cues: genuine auth signals, emitted as AuthHint.
 AUTH_HINT_PATTERNS = [
     (re.compile(r"\bjwt\b|\bjsonwebtoken\b", re.IGNORECASE), "atproto_auth:jwt"),
     (re.compile(r"\bserviceauth\b|\bservice_auth\b", re.IGNORECASE), "atproto_auth:service_auth"),
     (re.compile(r"\bdid:[a-z0-9:._-]+\b", re.IGNORECASE), "atproto_identity:did_reference"),
     (re.compile(r"\bplc\b", re.IGNORECASE), "atproto_identity:plc"),
     (re.compile(r"\bsign(?:ing|ature)?\b|\bverify(?:ing|signature)?\b", re.IGNORECASE), "atproto_crypto:signing"),
+]
+# Protocol data-flow cues: ProtocolHint (AttackMap#258).
+PROTOCOL_HINT_PATTERNS = [
+    (re.compile(r"xrpc", re.IGNORECASE), "atproto_protocol:xrpc"),
     (re.compile(r"\brepo\b.*\bcommit\b|\bcommit\b.*\brepo\b", re.IGNORECASE), "atproto_repo:commit_flow"),
 ]
+LEXICON_ID_PATTERN = re.compile(r'"id"\s*:')
+LEXICON_SUBSCRIPTION_PATTERN = re.compile(r'"type"\s*:\s*"subscription"', re.IGNORECASE)
 
 EVENT_STREAM_PATTERNS = [
     (re.compile(r"\bsubscriberepos\b", re.IGNORECASE), "atproto_event_stream:subscribe_repos"),
@@ -132,13 +139,18 @@ class AtprotoAnalyzer:
         if not isinstance(data, dict):
             return
 
+        id_match = LEXICON_ID_PATTERN.search(content)
+        id_offset = id_match.start() if id_match else 0
+        sub_match = LEXICON_SUBSCRIPTION_PATTERN.search(content)
+        sub_offset = sub_match.start() if sub_match else id_offset
+
         lexicon_id = data.get("id")
         if isinstance(lexicon_id, str) and lexicon_id:
             namespace_root = self._namespace_root(lexicon_id)
             if namespace_root:
-                self._append_unique_auth(result, f"atproto_namespace:{namespace_root}", relative)
-            self._append_unique_auth(result, f"atproto_lexicon:{lexicon_id}", relative)
-            self._append_unique_route(result, f"/xrpc/{lexicon_id}", "ANY", relative)
+                self._append_protocol(result, f"atproto_namespace:{namespace_root}", relative, content, id_offset, 0.9)
+            self._append_protocol(result, f"atproto_lexicon:{lexicon_id}", relative, content, id_offset, 0.9)
+            self._append_unique_route(result, f"/xrpc/{lexicon_id}", "ANY", relative, line_of(content, id_offset))
 
         defs = data.get("defs")
         if isinstance(defs, dict):
@@ -148,44 +160,52 @@ class AtprotoAnalyzer:
                 def_type = str(value.get("type", "")).lower()
                 if def_type in {"query", "procedure", "subscription"} and isinstance(lexicon_id, str):
                     method = "SUBSCRIBE" if def_type == "subscription" else "ANY"
-                    self._append_unique_route(result, f"/xrpc/{lexicon_id}", method, relative)
+                    offset = sub_offset if def_type == "subscription" else id_offset
+                    self._append_unique_route(result, f"/xrpc/{lexicon_id}", method, relative, line_of(content, offset))
                     if def_type == "subscription":
-                        self._append_unique_auth(result, "atproto_event_stream:subscription_lexicon", relative)
+                        self._append_protocol(
+                            result, "atproto_event_stream:subscription_lexicon", relative, content, sub_offset, 0.9
+                        )
 
     def _extract_namespace_signals(self, content: str, relative: str, result: ScanResult) -> None:
         for match in NAMESPACE_PATTERN.finditer(content):
             namespace = match.group(1)
             namespace_root = self._namespace_root(namespace)
             if namespace_root:
-                self._append_unique_auth(result, f"atproto_namespace:{namespace_root}", relative)
-            self._append_unique_auth(result, f"atproto_namespace_ref:{namespace}", relative)
+                self._append_protocol(result, f"atproto_namespace:{namespace_root}", relative, content, match.start(), 0.8)
+            self._append_protocol(result, f"atproto_namespace_ref:{namespace}", relative, content, match.start(), 0.8)
 
     def _extract_xrpc_literals(self, content: str, relative: str, result: ScanResult) -> None:
         for match in XRPC_LITERAL_PATTERN.finditer(content):
             ns = match.group(1)
-            self._append_unique_route(result, f"/xrpc/{ns}", "ANY", relative)
-            self._append_unique_auth(result, f"atproto_xrpc_ref:{ns}", relative)
+            self._append_unique_route(result, f"/xrpc/{ns}", "ANY", relative, line_of(content, match.start()))
+            self._append_protocol(result, f"atproto_xrpc_ref:{ns}", relative, content, match.start(), 0.8)
 
     def _extract_protocol_hints(self, content: str, relative: str, result: ScanResult) -> None:
-        lowered = content.lower()
-        if "xrpc" in lowered:
-            self._append_unique_auth(result, "atproto_protocol:xrpc", relative)
+        for pattern, hint in PROTOCOL_HINT_PATTERNS:
+            match = pattern.search(content)
+            if match:
+                self._append_protocol(result, hint, relative, content, match.start(), 0.6)
         for pattern, hint in AUTH_HINT_PATTERNS:
-            if pattern.search(content):
-                self._append_unique_auth(result, hint, relative)
+            match = pattern.search(content)
+            if match:
+                self._append_unique_auth(result, hint, relative, content, match.start())
 
     def _extract_event_stream_hints(self, content: str, relative: str, result: ScanResult) -> None:
         for pattern, hint in EVENT_STREAM_PATTERNS:
-            if pattern.search(content):
-                self._append_unique_auth(result, hint, relative)
+            match = pattern.search(content)
+            if match:
+                self._append_protocol(result, hint, relative, content, match.start(), 0.7)
 
     def _extract_env_url_signals(self, content: str, relative: str, result: ScanResult) -> None:
         for match in ENV_URL_PATTERN.finditer(content):
             env_name = match.group(1)
-            self._append_unique_external(result, f"env://{env_name}", relative)
+            self._append_unique_external(result, f"env://{env_name}", relative, content, match.start())
             service_target = self._service_target_from_env(env_name)
             if service_target:
-                self._append_unique_auth(result, f"atproto_service_edge:{service_target}", relative)
+                self._append_protocol(
+                    result, f"atproto_service_edge:{service_target}", relative, content, match.start(), 0.5
+                )
 
     def _extract_service_notes(self, relative: str, result: ScanResult) -> None:
         normalized = relative.replace("\\", "/")
@@ -194,7 +214,16 @@ class AtprotoAnalyzer:
             if root in parts:
                 idx = parts.index(root)
                 if idx + 1 < len(parts):
-                    self._append_unique_auth(result, f"atproto_service_note:{parts[idx + 1].lower()}", relative)
+                    # Derived from the file's location, not a source line: anchor at line 1.
+                    self._append_protocol(
+                        result,
+                        f"atproto_service_note:{parts[idx + 1].lower()}",
+                        relative,
+                        None,
+                        None,
+                        0.6,
+                        evidence=f"inferred from path {relative}",
+                    )
                 return
 
     def _extract_secret_hints(self, content: str, relative: str, result: ScanResult) -> None:
@@ -203,7 +232,7 @@ class AtprotoAnalyzer:
             re.compile(r"['\"]([A-Z0-9_]*(?:SECRET|TOKEN|KEY|PASSWORD|SIGNING)[A-Z0-9_]*)['\"]"),
         ]:
             for match in pattern.finditer(content):
-                self._append_unique_secret(result, match.group(1), relative)
+                self._append_unique_secret(result, match.group(1), relative, content, match.start())
 
     @staticmethod
     def _namespace_root(namespace: str) -> str | None:
@@ -228,29 +257,66 @@ class AtprotoAnalyzer:
             result.languages.append(language)
 
     @staticmethod
-    def _append_unique_route(result: ScanResult, path: str, method: str, file: str) -> None:
+    def _append_unique_route(result: ScanResult, path: str, method: str, file: str, line: int) -> None:
         key = (path, method, file)
         if any((item.path, item.method, item.file) == key for item in result.routes):
             return
-        result.routes.append(Route(path=path, method=method, file=file))
+        result.routes.append(Route(path=path, method=method, file=file, line=line))
 
     @staticmethod
-    def _append_unique_external(result: ScanResult, target: str, file: str) -> None:
+    def _append_unique_external(result: ScanResult, target: str, file: str, content: str, offset: int) -> None:
         key = (target, file)
         if any((item.target, item.file) == key for item in result.external_calls):
             return
-        result.external_calls.append(ExternalCall(target=target, file=file))
+        line = line_of(content, offset)
+        result.external_calls.append(
+            ExternalCall(target=target, file=file, line=line, evidence_text=line_snippet(content, line) or target)
+        )
 
     @staticmethod
-    def _append_unique_auth(result: ScanResult, hint: str, file: str) -> None:
+    def _append_unique_auth(result: ScanResult, hint: str, file: str, content: str, offset: int) -> None:
         key = (hint, file)
         if any((item.hint, item.file) == key for item in result.auth_hints):
             return
-        result.auth_hints.append(AuthHint(hint=hint, file=file))
+        line = line_of(content, offset)
+        result.auth_hints.append(
+            AuthHint(hint=hint, file=file, line=line, evidence_text=line_snippet(content, line) or hint)
+        )
 
     @staticmethod
-    def _append_unique_secret(result: ScanResult, name: str, file: str) -> None:
+    def _append_protocol(
+        result: ScanResult,
+        hint: str,
+        file: str,
+        content: str | None,
+        offset: int | None,
+        confidence: float,
+        *,
+        evidence: str | None = None,
+    ) -> None:
+        """Append a ProtocolHint once per (hint, file).
+
+        Located at ``offset`` when given; path-derived hints pass
+        ``content=None`` and are anchored at line 1 with ``evidence``.
+        """
+        if any((item.hint, item.file) == (hint, file) for item in result.protocol_hints):
+            return
+        if content is not None and offset is not None:
+            line = line_of(content, offset)
+            evidence_text = line_snippet(content, line) or hint
+        else:
+            line = 1
+            evidence_text = evidence or hint
+        result.protocol_hints.append(
+            ProtocolHint(hint=hint, file=file, line=line, evidence_text=evidence_text, confidence=confidence)
+        )
+
+    @staticmethod
+    def _append_unique_secret(result: ScanResult, name: str, file: str, content: str, offset: int) -> None:
         key = (name, file)
         if any((item.name, item.file) == key for item in result.secret_hints):
             return
-        result.secret_hints.append(SecretHint(name=name, file=file))
+        line = line_of(content, offset)
+        result.secret_hints.append(
+            SecretHint(name=name, file=file, line=line, evidence_text=line_snippet(content, line) or name)
+        )
