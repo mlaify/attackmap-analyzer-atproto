@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- XRPC handler routes carry their auth in the core contract (AttackMap#256). `Route.auth` is `required` when an `auth:` verifier is set, and `anonymous` for bare handlers or optional verifiers (`*Optional*`, `nullCreds`). `guards` and `guard_evidence` cite the verifier. The `atproto_auth:route_verifier:*` / `atproto_route_auth:anonymous:*` hints stay for older cores.
+
 ### Removed — committed test/bytecode caches
 
 - **Untracked 9 cache files** that had been committed: `.pytest_cache/` (5 files) and `__pycache__/*.pyc` under `src/attackmap_analyzer_atproto/` and `tests/` (4 files). The existing `.gitignore` already lists `__pycache__/`, `.pytest_cache/`, `*.egg-info/`, `.venv/`, `build/` and `dist/`, so running the suite now leaves `git status` clean.
