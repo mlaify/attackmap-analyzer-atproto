@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed — committed test/bytecode caches
+
+- **Untracked 9 cache files** that had been committed: `.pytest_cache/` (5 files) and `__pycache__/*.pyc` under `src/attackmap_analyzer_atproto/` and `tests/` (4 files). The existing `.gitignore` already lists `__pycache__/`, `.pytest_cache/`, `*.egg-info/`, `.venv/`, `build/` and `dist/`, so running the suite now leaves `git status` clean.
+
 ### Fixed — XRPC methods, fake lexicon routes, detect() and pattern scope (#2)
 
 - **Routes only for XRPC endpoints, with their HTTP method.**
