@@ -1,0 +1,8 @@
+{
+  "lexicon": 1,
+  "id": "app.bsky.actor.defs",
+  "defs": {
+    "profileView": { "type": "object", "properties": { "did": { "type": "string" } } },
+    "viewerState": { "type": "object", "properties": {} }
+  }
+}

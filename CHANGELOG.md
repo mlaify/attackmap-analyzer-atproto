@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — XRPC methods, fake lexicon routes, detect() and pattern scope (#2)
+
+- **Routes only for XRPC endpoints, with their HTTP method.**
+  - A lexicon yields a route only when `defs.main.type` is `query` (`GET`), `procedure` (`POST`) or `subscription` (`WS`).
+  - `record`, `object` and defs-only lexicons such as `app.bsky.feed.post` and `app.bsky.actor.defs` no longer become `ANY /xrpc/<id>` routes. They are still lexicon `ProtocolHint`s.
+  - **Breaking:** procedure/query routes were `ANY` and subscriptions were `SUBSCRIBE`.
+- **Handler registrations and their per-endpoint auth.** `server.method('<nsid>', …)` and the generated `server.<nsid>({ auth, handler })` form now emit `/xrpc/<nsid>` routes. The method comes from the repo's lexicon, or is `ANY` when the lexicon isn't in the repo.
+  - A configured `auth:` verifier is an `atproto_auth:route_verifier:<nsid>` `AuthHint` citing the `auth:` line. `test_signal_conformance.py` allows that prefix: the verifier is the endpoint's auth control.
+  - A handler without one, or with an optional verifier (`*Optional*`, `nullCreds`), gets an `atproto_route_auth:anonymous:<nsid>` `ProtocolHint`. It is not an `AuthHint`, so core never counts it as an auth control.
+  - Core's `Route` has no `auth` field on `main`, so per-route auth is carried by these hints.
+- **`detect()` is gated on real AT Protocol evidence:**
+  - a `lexicons/` dir
+  - an `@atproto/*` / `@did-plc/*` dependency in any `package.json`
+  - a lexicon document under a `lexicons/` path
+  - a quoted NSID under a known authority
+  - an `/xrpc/<nsid>` URL in JS/TS
+
+  The `"lexicon"` substring and bare `/xrpc/` checks are gone. `package-lock.json`, `npm-shrinkwrap.json` and AttackMap's own `attackmap-report.json` / `review-context-pack.json` / `defensive-review.json` are never read. Other JSON is only parsed to recognize lexicon documents (`{"lexicon": 1, "id": …}`), anywhere in the repo, instead of being scanned as code.
+- **Any NSID authority.** Namespace roots are the NSID's first two segments. `chat.bsky` and `tools.ozone` are built in, and any authority declared by a lexicon `id` in the repo (e.g. `sh.tangled`) is recognized in code. `/xrpc/<nsid>` literals accept any NSID.
+- **Secrets are `process.env.*` only.** The quoted-constant pattern reported `'KEY'`, `"TOKEN"` and enum values. `process.env.X` / `process.env['X']` with `SECRET`/`TOKEN`/`KEY`/`PASSWORD`/`SIGNING` still match.
+- **Auth cues no longer match prose.**
+  - `atproto_identity:plc` needs `did:plc:`, `plc.directory`, `@did-plc/` or `PlcClient`, not the word "plc".
+  - `atproto_crypto:signing` needs `@atproto/crypto`, a keypair type, a signing/verification API (`verifySignature`, `verifyJwt`, `createServiceJwt`, …) or `keypair.`/`signingKey.`/`crypto.` `sign(`/`verify(`, not the words "sign"/"verify".
+
 ### Changed — typed signals instead of overloaded `AuthHint`s (AttackMap#258)
 
 - **`auth_hints` now carries only auth, identity and signing cues** (`atproto_auth:jwt`, `atproto_auth:service_auth`, `atproto_identity:did_reference`, `atproto_identity:plc`, `atproto_crypto:signing`). Protocol metadata moved to `ProtocolHint` (`protocol_hints`) with the same hint strings, which is where core's AT Protocol chain builder and `_extract_prefixed_hints` read every `atproto_` prefix from:

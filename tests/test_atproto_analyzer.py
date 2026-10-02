@@ -46,8 +46,9 @@ def test_analyze_extracts_protocol_surface_and_hints() -> None:
     external_targets = {call.target for call in result.external_calls}
     secret_names = {secret.name for secret in result.secret_hints}
 
-    assert ("/xrpc/com.atproto.server.createSession", "ANY") in route_keys
-    assert ("/xrpc/com.atproto.sync.subscribeRepos", "SUBSCRIBE") in route_keys
+    # XRPC binding (#2): procedure = POST, subscription = WebSocket.
+    assert ("/xrpc/com.atproto.server.createSession", "POST") in route_keys
+    assert ("/xrpc/com.atproto.sync.subscribeRepos", "WS") in route_keys
 
     # Protocol metadata is a ProtocolHint (AttackMap#258) ...
     assert "atproto_namespace:com.atproto" in protocol_hints
@@ -106,7 +107,7 @@ def test_repo_checked_out_under_build_dir_is_still_analyzed(tmp_path: Path) -> N
     assert analyzer.detect(repo) is True
     result = analyzer.analyze(repo)
     assert result.files_scanned > 0
-    assert ("/xrpc/com.atproto.server.createSession", "ANY") in {(r.path, r.method) for r in result.routes}
+    assert ("/xrpc/com.atproto.server.createSession", "POST") in {(r.path, r.method) for r in result.routes}
     assert "atproto_service_note:pds" in {h.hint for h in result.protocol_hints}
 
 
@@ -157,5 +158,99 @@ def test_lexicon_signals_cite_the_id_and_subscription_lines() -> None:
     by_hint = {h.hint: h for h in result.protocol_hints if h.file == lexicon}
     assert by_hint["atproto_lexicon:com.atproto.sync.subscribeRepos"].evidence_text.startswith('"id"')
     assert by_hint["atproto_event_stream:subscription_lexicon"].evidence_text == '"type": "subscription"'
-    subscribe = next(r for r in result.routes if r.file == lexicon and r.method == "SUBSCRIBE")
+    subscribe = next(r for r in result.routes if r.file == lexicon and r.method == "WS")
     assert subscribe.line == by_hint["atproto_event_stream:subscription_lexicon"].line
+
+
+# ---------------------------------------------------------------------------
+# XRPC methods, record/defs lexicons, detect(), NSIDs, secrets, auth (#2)
+# ---------------------------------------------------------------------------
+
+OVERLAY = "atproto_overlay_repo"
+
+
+def _routes(fixture: str = OVERLAY) -> set[tuple[str, str]]:
+    return {(r.path, r.method) for r in AtprotoAnalyzer().analyze(FIXTURES / fixture).routes}
+
+
+def test_record_and_defs_lexicons_produce_no_routes() -> None:
+    paths = {path for path, _method in _routes()}
+    assert "/xrpc/app.bsky.feed.post" not in paths  # record
+    assert "/xrpc/app.bsky.actor.defs" not in paths  # defs-only
+    # They are still lexicon metadata.
+    hints = {h.hint for h in AtprotoAnalyzer().analyze(FIXTURES / OVERLAY).protocol_hints}
+    assert {"atproto_lexicon:app.bsky.feed.post", "atproto_lexicon:app.bsky.actor.defs"} <= hints
+
+
+def test_query_procedure_subscription_map_to_get_post_ws() -> None:
+    routes = _routes()
+    assert ("/xrpc/app.bsky.feed.getTimeline", "GET") in routes  # query
+    assert ("/xrpc/sh.tangled.repo.create", "POST") in routes  # procedure
+    assert ("/xrpc/com.atproto.sync.subscribeRepos", "WS") in _routes("atproto_like_repo")  # subscription
+    assert not any(method in {"ANY", "SUBSCRIBE"} for path, method in routes if path != "/xrpc/app.bsky.feed.getPostThread")
+
+
+def test_lockfile_mentioning_lexicon_does_not_trigger_detect(tmp_path: Path) -> None:
+    (tmp_path / "package.json").write_text('{"name": "web", "dependencies": {"react": "^18"}}')
+    (tmp_path / "package-lock.json").write_text(
+        '{"packages": {"node_modules/lexicon-parser": {"version": "1.0.0", "resolved": "https://x/xrpc/a"}}}'
+    )
+    (tmp_path / "index.js").write_text("// see the lexicon page in our docs\nconsole.log('hi');\n")
+    assert AtprotoAnalyzer().detect(tmp_path) is False
+
+
+def test_detect_fires_on_atproto_dependency_or_nsid_literal(tmp_path: Path) -> None:
+    pkg = tmp_path / "packages" / "client"
+    pkg.mkdir(parents=True)
+    (pkg / "package.json").write_text('{"name": "client", "dependencies": {"@atproto/api": "^0.13.0"}}')
+    assert AtprotoAnalyzer().detect(tmp_path) is True
+
+    other = tmp_path / "other"
+    other.mkdir()
+    (other / "feed.ts").write_text("export const FEED = 'app.bsky.feed.generator';\n")
+    assert AtprotoAnalyzer().detect(other) is True
+
+
+def test_attackmap_report_at_repo_root_is_not_read(tmp_path: Path) -> None:
+    (tmp_path / "attackmap-report.json").write_text('{"lexicon": 1, "id": "app.bsky.stale.report", "defs": {}}')
+    assert AtprotoAnalyzer().detect(tmp_path) is False
+    result = AtprotoAnalyzer().analyze(tmp_path)
+    assert result.files_scanned == 0
+
+
+def test_third_party_nsids_are_recognized() -> None:
+    result = AtprotoAnalyzer().analyze(FIXTURES / OVERLAY)
+    hints = {h.hint for h in result.protocol_hints}
+    assert "atproto_namespace:sh.tangled" in hints
+    assert "atproto_lexicon:sh.tangled.repo.create" in hints
+    # The code-side handler registration is linked too, with the lexicon's method.
+    assert ("/xrpc/sh.tangled.repo.create", "POST", "src/server.ts") in {
+        (r.path, r.method, r.file) for r in result.routes
+    }
+
+
+def test_quoted_constants_are_not_secrets_but_env_secrets_are() -> None:
+    names = {s.name for s in AtprotoAnalyzer().analyze(FIXTURES / OVERLAY).secret_hints}
+    assert "KEY" not in names
+    assert "TOKEN" not in names
+    assert "PDS_JWT_SECRET" in names
+
+
+def test_prose_sign_verify_plc_are_not_auth_hints() -> None:
+    hints = {h.hint for h in AtprotoAnalyzer().analyze(FIXTURES / OVERLAY).auth_hints}
+    assert "atproto_crypto:signing" not in hints
+    assert "atproto_identity:plc" not in hints
+
+
+def test_handlers_without_an_auth_verifier_are_marked_anonymous() -> None:
+    result = AtprotoAnalyzer().analyze(FIXTURES / OVERLAY)
+    anonymous = {h.hint for h in result.protocol_hints if h.hint.startswith("atproto_route_auth:anonymous:")}
+    assert anonymous == {
+        "atproto_route_auth:anonymous:sh.tangled.repo.create",  # bare handler function
+        "atproto_route_auth:anonymous:app.bsky.feed.getPostThread",  # optional verifier
+    }
+    verified = [h for h in result.auth_hints if h.hint.startswith("atproto_auth:route_verifier:")]
+    assert [h.hint for h in verified] == ["atproto_auth:route_verifier:app.bsky.feed.getTimeline"]
+    assert verified[0].evidence_text == "auth: ctx.authVerifier.standard,"
+    # The anonymous marker is never an AuthHint (core would count it as a control).
+    assert not any("anonymous" in h.hint for h in result.auth_hints)
