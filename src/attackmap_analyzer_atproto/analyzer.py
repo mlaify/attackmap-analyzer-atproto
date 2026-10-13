@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import bisect
 import re
 from pathlib import Path
 
@@ -239,7 +240,6 @@ class AtprotoAnalyzer:
             + "|".join(re.escape(r) for r in sorted(namespace_roots, key=len, reverse=True))
             + r")(?:\.[A-Za-z0-9_-]+)+)\b"
         )
-        handled: set[str] = set()
         for file_path in code_files:
             suffix = file_path.suffix.lower()
             result.files_scanned += 1
@@ -251,7 +251,7 @@ class AtprotoAnalyzer:
 
             self._extract_namespace_signals(content, relative, result, namespace_pattern)
             self._extract_xrpc_literals(content, relative, result, lexicon_types)
-            self._extract_xrpc_handlers(content, relative, result, lexicon_types, handled)
+            self._extract_xrpc_handlers(content, relative, result, lexicon_types)
             self._extract_protocol_hints(content, relative, result)
             self._extract_event_stream_hints(content, relative, result)
             self._extract_env_url_signals(content, relative, result)
@@ -333,7 +333,7 @@ class AtprotoAnalyzer:
             self._append_protocol(result, f"atproto_xrpc_ref:{ns}", relative, content, match.start(), 0.8)
 
     def _extract_xrpc_handlers(
-        self, content: str, relative: str, result: ScanResult, lexicon_types: dict[str, str], handled: set[str]
+        self, content: str, relative: str, result: ScanResult, lexicon_types: dict[str, str]
     ) -> None:
         """Server-side handler registrations and their per-endpoint auth.
 
@@ -348,6 +348,7 @@ class AtprotoAnalyzer:
         counts it as an auth control.
         """
         calls = [(m, m.group(1)) for m in XRPC_METHOD_CALL_PATTERN.finditer(content)]
+        declarations = self._declarations(content) if "auth" in content else {}
         calls += [(m, m.group(1).removesuffix(".main")) for m in XRPC_ADD_CALL_PATTERN.finditer(content)]
         calls += [
             (m, m.group(1))
@@ -358,7 +359,6 @@ class AtprotoAnalyzer:
             offset = match.start()
             line = line_of(content, offset)
             method = lexicon_types.get(nsid, "ANY")
-            handled.add(nsid)
             literal = self._object_literal_top_level(content, match.end())
             verifier_match = AUTH_KEY_PATTERN.search(literal[1]) if literal is not None else None
             verifier = verifier_match.group("verifier").strip() if verifier_match else None
@@ -366,11 +366,11 @@ class AtprotoAnalyzer:
             # value when the file declares it before the registration.
             if literal is not None and verifier_match is None and AUTH_SHORTHAND_PATTERN.search(literal[1]):
                 name = "auth" if AUTH_SHORTHAND_NAME_PATTERN.search(literal[1]) else None
-                resolved = self._declared_value(content, name, offset) if name else None
+                resolved = self._declared_value(declarations, name, offset) if name else None
                 if resolved:
                     verifier_match, verifier = True, resolved
             elif verifier and BARE_NAME_PATTERN.match(verifier):
-                verifier = self._declared_value(content, verifier, offset) or verifier
+                verifier = self._declared_value(declarations, verifier, offset) or verifier
             guarded = bool(
                 literal is not None and verifier_match and verifier and not OPTIONAL_VERIFIER_PATTERN.search(verifier)
             )
@@ -408,13 +408,24 @@ class AtprotoAnalyzer:
                 )
 
     @staticmethod
-    def _declared_value(content: str, name: str, before: int) -> str | None:
+    def _declarations(content: str) -> dict[str, tuple[list[int], list[str]]]:
+        """`const|let|var <name> = …` in ``content``: name → (offsets, values), in
+        order. Built once per file, so many registrations stay linear."""
+        index: dict[str, tuple[list[int], list[str]]] = {}
+        for decl in CONST_DECL_PATTERN.finditer(content):
+            offsets, values = index.setdefault(decl.group(1), ([], []))
+            offsets.append(decl.start())
+            values.append(decl.group(2).strip())
+        return index
+
+    @staticmethod
+    def _declared_value(declarations: dict[str, tuple[list[int], list[str]]], name: str, before: int) -> str | None:
         """The right-hand side of the last `const|let|var <name> = …` before ``before``."""
-        value = None
-        for decl in CONST_DECL_PATTERN.finditer(content, 0, before):
-            if decl.group(1) == name:
-                value = decl.group(2).strip()
-        return value
+        entry = declarations.get(name)
+        if entry is None:
+            return None
+        k = bisect.bisect_left(entry[0], before)
+        return entry[1][k - 1] if k else None
 
     @staticmethod
     def _object_literal_top_level(content: str, start: int, limit: int = 20000) -> tuple[int, str] | None:
