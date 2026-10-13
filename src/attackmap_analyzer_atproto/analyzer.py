@@ -4,9 +4,22 @@ import json
 import re
 from pathlib import Path
 
-from attackmap.sdk import DEFAULT_SKIP_DIRS, iter_repo_files, line_of, line_snippet, read_source, rel
+from attackmap.sdk import (
+    DEFAULT_SKIP_DIRS,
+    AnalyzerMetadata,
+    AuthHint,
+    ExternalCall,
+    iter_repo_files,
+    line_of,
+    line_snippet,
+    ProtocolHint,
+    read_source,
+    rel,
+    Route,
+    ScanResult,
+    SecretHint,
+)
 
-from .contracts import AnalyzerMetadata, AuthHint, ExternalCall, ProtocolHint, Route, ScanResult, SecretHint
 
 CODE_SUFFIXES = {".ts", ".tsx", ".js", ".mjs", ".cjs", ".json"}
 # Pruned by repo-relative directory name; also skips AttackMap's own report
