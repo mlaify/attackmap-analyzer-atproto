@@ -57,6 +57,19 @@ XRPC_METHODS = {"query": "GET", "procedure": "POST", "subscription": "WS"}
 # generated-API form `server.app.bsky.feed.getTimeline({ auth, handler })`.
 XRPC_METHOD_CALL_PATTERN = re.compile(rf"\b(?:server|xrpc|xrpcServer)\.method\(\s*['\"`]({NSID})['\"`]\s*,\s*")
 XRPC_GENERATED_CALL_PATTERN = re.compile(rf"\bserver\.({NSID})\(\s*(?=\{{)")
+# The current xrpc-server API: `server.add(app.bsky.actor.putPreferences, { auth, handler })`
+# (or a bare handler), where the first argument is the generated lexicon
+# namespace object, spelled like its NSID (mlaify/attackmap-analyzer-atproto#14).
+XRPC_ADD_CALL_PATTERN = re.compile(rf"\b(?:server|xrpc|xrpcServer)\.add\(\s*({NSID})\s*,\s*")
+# A handler passed as a function: no `auth:`, so the endpoint is anonymous.
+INLINE_FUNCTION_PATTERN = re.compile(r"(?:async\s+)?(?:function\b|\([^()]{0,200}\)\s*=>|[A-Za-z_$][\w$]{0,63}\s*=>)")
+# `{ auth, handler }` shorthand or `{ ...config }` spread: the verifier isn't visible here.
+# `const auth = ctx.authVerifier.standard` earlier in the file, for `{ auth, handler }`
+# or `auth: someVerifier` (#14).
+CONST_DECL_PATTERN = re.compile(r"\b(?:const|let|var)[ \t]+([A-Za-z_$][\w$]{0,63})[ \t]*=[ \t]*([^\n;]{1,200})")
+AUTH_SHORTHAND_NAME_PATTERN = re.compile(r"(?:^|[{,\s])auth\s*(?=[,}])")
+BARE_NAME_PATTERN = re.compile(r"[A-Za-z_$][\w$]{0,63}$")
+AUTH_SHORTHAND_PATTERN = re.compile(r"(?:^|[{,\s])(?:auth\s*(?=[,}])|\.\.\.)")
 AUTH_KEY_PATTERN = re.compile(r"(?:^|[{,\s])auth\s*:\s*(?P<verifier>[^,}\n]+)")
 # Verifiers that let unauthenticated callers through.
 OPTIONAL_VERIFIER_PATTERN = re.compile(r"optional|nullCreds|\bnull\b|\bundefined\b", re.IGNORECASE)
@@ -226,6 +239,7 @@ class AtprotoAnalyzer:
             + "|".join(re.escape(r) for r in sorted(namespace_roots, key=len, reverse=True))
             + r")(?:\.[A-Za-z0-9_-]+)+)\b"
         )
+        handled: set[str] = set()
         for file_path in code_files:
             suffix = file_path.suffix.lower()
             result.files_scanned += 1
@@ -237,7 +251,7 @@ class AtprotoAnalyzer:
 
             self._extract_namespace_signals(content, relative, result, namespace_pattern)
             self._extract_xrpc_literals(content, relative, result, lexicon_types)
-            self._extract_xrpc_handlers(content, relative, result, lexicon_types)
+            self._extract_xrpc_handlers(content, relative, result, lexicon_types, handled)
             self._extract_protocol_hints(content, relative, result)
             self._extract_event_stream_hints(content, relative, result)
             self._extract_env_url_signals(content, relative, result)
@@ -286,7 +300,14 @@ class AtprotoAnalyzer:
             return
         lexicon_types[lexicon_id] = method
         offset = sub_offset if def_type == "subscription" else id_offset
-        self._append_unique_route(result, f"/xrpc/{lexicon_id}", method, relative, line_of(content, offset))
+        # A lexicon declares an endpoint; it doesn't serve one (#14). Repos
+        # that only consume the API (social-app) vendor hundreds of them. The
+        # route comes from the handler registration; the declaration stays a
+        # protocol hint, with the method in its evidence.
+        self._append_protocol(
+            result, f"atproto_xrpc_declared:{lexicon_id}", relative, content, offset, 0.9,
+            evidence=f"{method} /xrpc/{lexicon_id} declared by lexicon (no route unless a handler registers it)",
+        )
         if def_type == "subscription":
             self._append_protocol(
                 result, "atproto_event_stream:subscription_lexicon", relative, content, sub_offset, 0.9
@@ -312,7 +333,7 @@ class AtprotoAnalyzer:
             self._append_protocol(result, f"atproto_xrpc_ref:{ns}", relative, content, match.start(), 0.8)
 
     def _extract_xrpc_handlers(
-        self, content: str, relative: str, result: ScanResult, lexicon_types: dict[str, str]
+        self, content: str, relative: str, result: ScanResult, lexicon_types: dict[str, str], handled: set[str]
     ) -> None:
         """Server-side handler registrations and their per-endpoint auth.
 
@@ -327,6 +348,7 @@ class AtprotoAnalyzer:
         counts it as an auth control.
         """
         calls = [(m, m.group(1)) for m in XRPC_METHOD_CALL_PATTERN.finditer(content)]
+        calls += [(m, m.group(1).removesuffix(".main")) for m in XRPC_ADD_CALL_PATTERN.finditer(content)]
         calls += [
             (m, m.group(1))
             for m in XRPC_GENERATED_CALL_PATTERN.finditer(content)
@@ -336,12 +358,35 @@ class AtprotoAnalyzer:
             offset = match.start()
             line = line_of(content, offset)
             method = lexicon_types.get(nsid, "ANY")
+            handled.add(nsid)
             literal = self._object_literal_top_level(content, match.end())
             verifier_match = AUTH_KEY_PATTERN.search(literal[1]) if literal is not None else None
             verifier = verifier_match.group("verifier").strip() if verifier_match else None
+            # `{ auth, handler }` or `auth: someVerifier`: use the variable's
+            # value when the file declares it before the registration.
+            if literal is not None and verifier_match is None and AUTH_SHORTHAND_PATTERN.search(literal[1]):
+                name = "auth" if AUTH_SHORTHAND_NAME_PATTERN.search(literal[1]) else None
+                resolved = self._declared_value(content, name, offset) if name else None
+                if resolved:
+                    verifier_match, verifier = True, resolved
+            elif verifier and BARE_NAME_PATTERN.match(verifier):
+                verifier = self._declared_value(content, verifier, offset) or verifier
             guarded = bool(
                 literal is not None and verifier_match and verifier and not OPTIONAL_VERIFIER_PATTERN.search(verifier)
             )
+            # The verifier can't be read: a config passed by name
+            # (`server.add(ns, config)`), or `{ auth, handler }` / `{ ...cfg }`
+            # without an explicit `auth:` (#14). A handler function has no
+            # verifier at all, so it is anonymous.
+            unreadable = (literal is None and not INLINE_FUNCTION_PATTERN.match(content, match.end())) or (
+                literal is not None and verifier_match is None and AUTH_SHORTHAND_PATTERN.search(literal[1])
+            )
+            if unreadable:
+                self._append_unique_route(
+                    result, f"/xrpc/{nsid}", method, relative, line,
+                    guard_evidence="auth verifier not visible at the registration",
+                )
+                continue
             # Route.auth (AttackMap#256): a required verifier guards the
             # endpoint; no verifier, or one that admits unauthenticated
             # callers, leaves it reachable anonymously.
@@ -353,7 +398,7 @@ class AtprotoAnalyzer:
             )
             if guarded:
                 # Cite the `auth: <verifier>` line itself.
-                verifier_offset = literal[0] + verifier_match.start("verifier")
+                verifier_offset = literal[0] + verifier_match.start("verifier") if verifier_match is not True else offset
                 self._append_unique_auth(
                     result, f"atproto_auth:route_verifier:{nsid}", relative, content, verifier_offset
                 )
@@ -361,6 +406,15 @@ class AtprotoAnalyzer:
                 self._append_protocol(
                     result, f"atproto_route_auth:anonymous:{nsid}", relative, content, offset, 0.7
                 )
+
+    @staticmethod
+    def _declared_value(content: str, name: str, before: int) -> str | None:
+        """The right-hand side of the last `const|let|var <name> = …` before ``before``."""
+        value = None
+        for decl in CONST_DECL_PATTERN.finditer(content, 0, before):
+            if decl.group(1) == name:
+                value = decl.group(2).strip()
+        return value
 
     @staticmethod
     def _object_literal_top_level(content: str, start: int, limit: int = 20000) -> tuple[int, str] | None:
@@ -539,7 +593,7 @@ class AtprotoAnalyzer:
             return
         if content is not None and offset is not None:
             line = line_of(content, offset)
-            evidence_text = line_snippet(content, line) or hint
+            evidence_text = evidence or line_snippet(content, line) or hint
         else:
             line = 1
             evidence_text = evidence or hint

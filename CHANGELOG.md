@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — `server.add` handlers and lexicon-only routes (#14)
+
+- **XRPC handlers registered with `server.add(<lexicon>, …)` are routes with their real auth (#14).** The current xrpc-server API (`server.add(app.bsky.actor.putPreferences, { auth: ctx.authVerifier.authorization(…), handler })`, 308 registrations in bluesky-social/atproto) wasn't recognized, so the XRPC surface came only from lexicon JSON with `auth: unknown`. Each registration is now a route at the handler's file and line, with `auth: required` for a verifier, `anonymous` for an optional one (`*Optional*`, `nullCreds`) or a bare handler function, and `unknown` when the verifier isn't visible (a config passed by name, `{ auth }` shorthand with no `const auth = …` in the file). `{ auth, handler }` and `auth: someVerifier` resolve through a `const` declared earlier in the file.
+- **A lexicon declares an endpoint; it no longer emits a route.** Repos that only consume the API (social-app vendors 256 lexicons) got hundreds of "served" routes, which core reported as unauthenticated state changes. A lexicon now yields an `atproto_xrpc_declared:<nsid>` protocol hint (method in its evidence); the route comes from the handler registration, so core's taint walk starts at the handler.
+
 ### Added
 
 - XRPC handler routes carry their auth in the core contract (AttackMap#256). `Route.auth` is `required` when an `auth:` verifier is set, and `anonymous` for bare handlers or optional verifiers (`*Optional*`, `nullCreds`). `guards` and `guard_evidence` cite the verifier. The `atproto_auth:route_verifier:*` / `atproto_route_auth:anonymous:*` hints stay for older cores.

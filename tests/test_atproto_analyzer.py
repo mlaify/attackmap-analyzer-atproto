@@ -1,3 +1,4 @@
+import json
 import shutil
 import sys
 from pathlib import Path
@@ -64,6 +65,8 @@ def test_analyze_extracts_protocol_surface_and_hints() -> None:
         "atproto_identity:did_reference",
         "atproto_identity:plc",
         "atproto_crypto:signing",
+        # The fixture's `server.add(com.atproto.sync.subscribeRepos, { auth: … })` (#14).
+        "atproto_auth:route_verifier:com.atproto.sync.subscribeRepos",
     }
 
     assert "env://RELAY_URL" in external_targets
@@ -158,8 +161,11 @@ def test_lexicon_signals_cite_the_id_and_subscription_lines() -> None:
     by_hint = {h.hint: h for h in result.protocol_hints if h.file == lexicon}
     assert by_hint["atproto_lexicon:com.atproto.sync.subscribeRepos"].evidence_text.startswith('"id"')
     assert by_hint["atproto_event_stream:subscription_lexicon"].evidence_text == '"type": "subscription"'
-    subscribe = next(r for r in result.routes if r.file == lexicon and r.method == "WS")
-    assert subscribe.line == by_hint["atproto_event_stream:subscription_lexicon"].line
+    # The lexicon declares the endpoint (#14): a hint at the subscription line, no route.
+    declared = by_hint["atproto_xrpc_declared:com.atproto.sync.subscribeRepos"]
+    assert declared.line == by_hint["atproto_event_stream:subscription_lexicon"].line
+    assert declared.evidence_text.startswith("WS /xrpc/com.atproto.sync.subscribeRepos")
+    assert not any(r.file == lexicon for r in result.routes)
 
 
 # ---------------------------------------------------------------------------
@@ -266,3 +272,108 @@ def test_handler_routes_carry_declared_auth_state() -> None:
     assert timeline.guards == ["auth: ctx.authVerifier.standard"]
     assert by_nsid["app.bsky.feed.getPostThread"].auth == "anonymous"  # optional verifier
     assert by_nsid["sh.tangled.repo.create"].auth == "anonymous"  # bare handler
+
+
+# ---------------------------------------------------------------------------
+# `server.add(<lexicon>, {auth, handler})` and lexicon-only endpoints (#14)
+# ---------------------------------------------------------------------------
+
+_LEXICONS = {
+    "lexicons/app/bsky/actor/putPreferences.json": '{"lexicon": 1, "id": "app.bsky.actor.putPreferences", "defs": {"main": {"type": "procedure"}}}',
+    "lexicons/app/bsky/actor/getProfile.json": '{"lexicon": 1, "id": "app.bsky.actor.getProfile", "defs": {"main": {"type": "query"}}}',
+    "lexicons/com/atproto/server/createSession.json": '{"lexicon": 1, "id": "com.atproto.server.createSession", "defs": {"main": {"type": "procedure"}}}',
+    "lexicons/app/bsky/feed/getTimeline.json": '{"lexicon": 1, "id": "app.bsky.feed.getTimeline", "defs": {"main": {"type": "query"}}}',
+    "lexicons/app/bsky/feed/getFeed.json": '{"lexicon": 1, "id": "app.bsky.feed.getFeed", "defs": {"main": {"type": "query"}}}',
+}
+
+
+def _repo(tmp_path: Path, handlers: str | None) -> Path:
+    for rel_path, text in _LEXICONS.items():
+        target = tmp_path / rel_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text)
+    if handlers is not None:
+        api = tmp_path / "packages" / "pds" / "src" / "api.ts"
+        api.parent.mkdir(parents=True, exist_ok=True)
+        api.write_text(handlers)
+    return tmp_path
+
+
+_HANDLERS = """export default function (server: Server, ctx: AppContext) {
+  server.add(app.bsky.actor.putPreferences, {
+    auth: ctx.authVerifier.authorization({ authorize: (p) => p.assertRpc('app.bsky.actor.putPreferences') }),
+    handler: async ({ auth, input }) => ctx.prefs.put(auth.credentials.did, input.body),
+  })
+  server.add(app.bsky.actor.getProfile, {
+    auth: ctx.authVerifier.standardOptional,
+    handler: async ({ params }) => ctx.views.profile(params.actor),
+  })
+  server.add(com.atproto.server.createSession, async ({ input }) => ctx.login(input.body))
+  server.add(app.bsky.feed.getTimeline, timelineConfig)
+  server.add(app.bsky.feed.getFeed, { auth, handler })
+}
+"""
+
+
+def _route_map(repo: Path) -> dict[str, object]:
+    return {r.path: r for r in AtprotoAnalyzer().analyze(repo).routes}
+
+
+def test_server_add_registrations_become_routes_with_their_auth(tmp_path: Path) -> None:
+    routes = _route_map(_repo(tmp_path, _HANDLERS))
+    put = routes["/xrpc/app.bsky.actor.putPreferences"]
+    assert (put.method, put.file, put.line, put.auth) == ("POST", "packages/pds/src/api.ts", 2, "required")
+    assert put.guards == ["auth: ctx.authVerifier.authorization"]
+    assert routes["/xrpc/app.bsky.actor.getProfile"].auth == "anonymous"  # optional verifier
+    assert routes["/xrpc/com.atproto.server.createSession"].auth == "anonymous"  # bare handler
+    # The verifier isn't visible: a config passed by name, or `{ auth, handler }`.
+    assert routes["/xrpc/app.bsky.feed.getTimeline"].auth == "unknown"
+    assert routes["/xrpc/app.bsky.feed.getFeed"].auth == "unknown"
+    assert all(r.file == "packages/pds/src/api.ts" for r in routes.values())
+
+
+def test_lexicons_without_a_handler_are_declared_not_served(tmp_path: Path) -> None:
+    # A client repo (social-app) vendors the lexicons but serves none of them.
+    result = AtprotoAnalyzer().analyze(_repo(tmp_path, None))
+    assert result.routes == []
+    declared = {h.hint for h in result.protocol_hints if h.hint.startswith("atproto_xrpc_declared:")}
+    assert declared == {f"atproto_xrpc_declared:{json.loads(t)['id']}" for t in _LEXICONS.values()}
+
+
+def test_only_registered_lexicons_become_routes(tmp_path: Path) -> None:
+    handlers = "server.add(app.bsky.actor.getProfile, { auth: ctx.authVerifier.standard, handler })\n"
+    routes = _route_map(_repo(tmp_path, handlers))
+    assert set(routes) == {"/xrpc/app.bsky.actor.getProfile"}
+    assert routes["/xrpc/app.bsky.actor.getProfile"].auth == "required"
+
+
+def test_shorthand_auth_resolves_to_the_declared_verifier(tmp_path: Path) -> None:
+    handlers = (
+        "export default function (server: Server, ctx: AppContext) {\n"
+        "  const auth = ctx.authVerifier.authorization({ authorize: () => {} })\n"
+        "  server.add(app.bsky.actor.putPreferences, { auth, handler: async () => ({}) })\n"
+        "}\n"
+        "export function other(server: Server, ctx: AppContext) {\n"
+        "  const auth = ctx.authVerifier.standardOptional\n"
+        "  const verifier = ctx.authVerifier.standard\n"
+        "  server.add(app.bsky.actor.getProfile, { auth, handler: async () => ({}) })\n"
+        "  server.add(app.bsky.feed.getTimeline, { auth: verifier, handler: async () => ({}) })\n"
+        "}\n"
+    )
+    routes = _route_map(_repo(tmp_path, handlers))
+    assert routes["/xrpc/app.bsky.actor.putPreferences"].auth == "required"
+    assert routes["/xrpc/app.bsky.actor.getProfile"].auth == "anonymous"  # nearest `auth` is optional
+    assert routes["/xrpc/app.bsky.feed.getTimeline"].auth == "required"
+    assert routes["/xrpc/app.bsky.feed.getTimeline"].guards == ["auth: ctx.authVerifier.standard"]
+
+
+def test_handler_extraction_never_raises_on_garbage(tmp_path: Path) -> None:
+    import random
+
+    rng = random.Random(14)
+    alphabet = "server.add(app.bsky.x.y, {auth: handler}) => const auth = ctx;'\"`\n\\"
+    analyzer = AtprotoAnalyzer()
+    for i in range(300):
+        text = "server.add(app.bsky.feed.get, " + "".join(rng.choice(alphabet) for _ in range(rng.randint(0, 300)))
+        result = ScanResult(root=str(tmp_path))
+        analyzer._extract_xrpc_handlers(text, f"f{i}.ts", result, {}, set())
