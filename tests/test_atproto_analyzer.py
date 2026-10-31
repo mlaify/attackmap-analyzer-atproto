@@ -25,7 +25,7 @@ def test_metadata_contains_required_fields() -> None:
 
     assert metadata.name == "atproto"
     assert metadata.display_name == "AT Protocol Analyzer"
-    assert metadata.version == "0.1.0"
+    assert metadata.version == "0.2.0"
     assert metadata.description
     assert metadata.scope
     assert "atproto" in metadata.targets

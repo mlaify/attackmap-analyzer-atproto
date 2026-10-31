@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-31
+
+### Changed — packaging
+
+- Released to the mlaify package index (https://pkg.mlaify.io/pypi/simple/). A `v*` tag now builds the wheel and sdist and attaches them to a GitHub release (`.github/workflows/release.yml`); the index picks them up within six hours.
+- The `core` and `dev` extras require `attackmap>=0.6.0` from the index instead of AttackMap's git main.
+
 ### Fixed — `server.add` handlers and lexicon-only routes (#14)
 
 - **XRPC handlers registered with `server.add(<lexicon>, …)` are routes with their real auth (#14).** The current xrpc-server API (`server.add(app.bsky.actor.putPreferences, { auth: ctx.authVerifier.authorization(…), handler })`, 308 registrations in bluesky-social/atproto) wasn't recognized, so the XRPC surface came only from lexicon JSON with `auth: unknown`. Each registration is now a route at the handler's file and line, with `auth: required` for a verifier, `anonymous` for an optional one (`*Optional*`, `nullCreds`) or a bare handler function, and `unknown` when the verifier isn't visible (a config passed by name, `{ auth }` shorthand with no `const auth = …` in the file). `{ auth, handler }` and `auth: someVerifier` resolve through a `const` declared earlier in the file.
@@ -80,5 +87,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Emits Signal-v2 records (`file:line` citation, evidence text, and confidence
   score) for every signal.
 
-[Unreleased]: https://github.com/mlaify/attackmap-analyzer-atproto/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/mlaify/attackmap-analyzer-atproto/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/mlaify/attackmap-analyzer-atproto/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/mlaify/attackmap-analyzer-atproto/releases/tag/v0.1.0
