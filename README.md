@@ -29,6 +29,9 @@ This module is heuristic and intentionally lightweight.
 ## Install
 
 ```bash
+uv tool install attackmap --with attackmap-analyzer-atproto \
+  --index mlaify=https://pkg.mlaify.io/pypi/simple/ --index-strategy first-index
+# or from source:
 pip install git+https://github.com/mlaify/attackmap-analyzer-atproto.git
 ```
 

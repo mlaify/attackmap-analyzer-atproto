@@ -115,7 +115,7 @@ class AtprotoAnalyzer:
     metadata = AnalyzerMetadata(
         name="atproto",
         display_name="AT Protocol Analyzer",
-        version="0.1.0",
+        version="0.2.0",
         description="Thin protocol-aware overlay analyzer for AT Protocol namespace and XRPC exposure.",
         scope="AT Protocol repositories with lexicons, XRPC namespace usage, and protocol auth/identity cues.",
         targets=["atproto", "bluesky", "xrpc"],
