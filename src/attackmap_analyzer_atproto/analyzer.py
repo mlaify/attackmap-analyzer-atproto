@@ -6,6 +6,7 @@ import re
 from pathlib import Path
 
 from attackmap.sdk import (
+    plugin_version,
     DEFAULT_SKIP_DIRS,
     AnalyzerMetadata,
     AuthHint,
@@ -115,7 +116,8 @@ class AtprotoAnalyzer:
     metadata = AnalyzerMetadata(
         name="atproto",
         display_name="AT Protocol Analyzer",
-        version="0.2.1",
+        version=plugin_version("attackmap-analyzer-atproto", default="0.2.1"),
+        requires_core=">=0.8,<2",
         description="Thin protocol-aware overlay analyzer for AT Protocol namespace and XRPC exposure.",
         scope="AT Protocol repositories with lexicons, XRPC namespace usage, and protocol auth/identity cues.",
         targets=["atproto", "bluesky", "xrpc"],
