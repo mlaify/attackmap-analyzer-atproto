@@ -116,7 +116,7 @@ class AtprotoAnalyzer:
     metadata = AnalyzerMetadata(
         name="atproto",
         display_name="AT Protocol Analyzer",
-        version=plugin_version("attackmap-analyzer-atproto", default="0.2.1"),
+        version=plugin_version("attackmap-analyzer-atproto", default="0.3.0"),
         requires_core=">=0.8,<2",
         description="Thin protocol-aware overlay analyzer for AT Protocol namespace and XRPC exposure.",
         scope="AT Protocol repositories with lexicons, XRPC namespace usage, and protocol auth/identity cues.",
